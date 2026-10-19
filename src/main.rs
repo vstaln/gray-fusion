@@ -45,7 +45,11 @@ Brief:
 fn gray_home() -> PathBuf {
     std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| PathBuf::from(h).join(".gray"))
+        })
         .unwrap_or_else(|| PathBuf::from(".gray"))
 }
 
@@ -590,6 +594,10 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
     }
 }
 
+/// Sweep stray processes still tagged with this handoff's env marker.
+/// Linux-only (`/proc/<pid>/environ`); a no-op elsewhere — `kill_tree`'s
+/// group/taskkill path is the portable cleanup.
+#[cfg(target_os = "linux")]
 fn sweep_tagged(handoff_id: &str) {
     let needle = format!("{ENV_HANDOFF_ID}={handoff_id}");
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -615,11 +623,36 @@ fn sweep_tagged(handoff_id: &str) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn sweep_tagged(_handoff_id: &str) {}
+
+/// SIGTERM the child's whole process group; on Windows taskkill the tree.
+fn terminate_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .output();
+}
+
+/// SIGKILL the process group after the grace window; taskkill /F on Windows.
+fn force_kill_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+}
+
 fn kill_tree(slot: &Slot, child: &mut Child, pid: u32) {
     if pid != 0 {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
-        }
+        terminate_tree(pid);
         let deadline = Instant::now() + TERM_GRACE;
         loop {
             match child.try_wait() {
@@ -630,9 +663,7 @@ fn kill_tree(slot: &Slot, child: &mut Child, pid: u32) {
                 _ => break,
             }
         }
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+        force_kill_tree(pid);
     }
     let deadline = Instant::now() + REAP_GRACE;
     loop {
