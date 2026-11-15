@@ -109,6 +109,7 @@ run_lead() {
             GRAY_BIN="$GRAY_BIN" GRAY_NO_CACHE_WARM=1 \
             ${FUSION_TMO:+GRAY_FUSION_HANDOFF_TIMEOUT=$FUSION_TMO} \
             ${SIDE_SLEEP:+SIDE_SLEEP=$SIDE_SLEEP} \
+            ${SIDE_EFFORT:+GRAY_FUSION_SIDEKICK_EFFORT=$SIDE_EFFORT} \
             STUB_TAG="$TAG" \
             timeout --signal=KILL "$tmo" \
             "$GRAY_BIN" -p "$prompt" --json --max-requests 50 "$@" \
@@ -694,6 +695,93 @@ EOF
     stop_stub
 }
 
+case_ledger() {
+    new_case ledger
+    cat >"$CASE_DIR/script.json" <<'EOF'
+{"lead":[
+ {"tool_calls":[{"name":"handoff","args":{"task":"record me","label":"l1"}}]},
+ {"text":"LEAD-LEDGER-DONE"}],
+ "side":[{"text":"SIDE-LEDGER-REPORT"}]}
+EOF
+    start_stub
+    write_home "$PORT" plain
+    cat >"$CASE_DIR/graywrap" <<EOF
+#!/usr/bin/env bash
+printf '%s\t%s\n' "\${GRAY_FUSION_SIDEKICK:-lead}" "\${GRAY_THINKING_EFFORT:-none}" >>"$CASE_DIR/graywrap.log"
+exec "$GRAY_BIN" "\$@"
+EOF
+    chmod +x "$CASE_DIR/graywrap"
+    GRAY_BIN="$CASE_DIR/graywrap" SIDE_EFFORT=max run_lead lead1 "begin work" 240
+    local rc; rc=$(cat "$CASE_DIR/lead1.exit")
+    echo "[$CASE_NAME] lead rc=$rc"
+    if [ "$NEW_MODE" != 1 ]; then
+        report FAIL "14-ledger" "old binary: no plugin ledger"
+        stop_stub
+        return
+    fi
+    python3 - "$CASE_DIR" "$(lead_sid "$CASE_DIR/lead1.jsonl")" <<'PY' >"$CASE_DIR/assertions.txt"
+import json, os, sys
+case_dir, sid = sys.argv[1], sys.argv[2]
+home = os.path.join(case_dir, "home")
+want_keys = ["ts", "lead_sid", "sidekick", "effort", "resumed", "retried_fresh",
+             "idle_secs", "outcome", "wall_secs", "brief_chars", "report_chars",
+             "usage", "requests", "tools"]
+try:
+    rows = [json.loads(l) for l in open(os.path.join(home, "fusion/stats.jsonl")) if l.strip()]
+except OSError:
+    rows = []
+side_in = side_out = side_n = 0
+try:
+    for l in open(os.path.join(case_dir, "requests.jsonl")):
+        r = json.loads(l)
+        if r.get("role") != "side":
+            continue
+        side_n += 1
+        seq = int(r.get("seq") or 0)
+        side_in += 200 + 13 * seq
+        side_out += 17 + 3 * seq
+except OSError:
+    pass
+efforts = []
+try:
+    for l in open(os.path.join(case_dir, "graywrap.log")):
+        who, eff = l.rstrip("\n").split("\t")
+        if who == "1":
+            efforts.append(eff)
+except OSError:
+    pass
+out = []
+def say(name, ok, detail):
+    out.append(("PASS" if ok else "FAIL") + "\t" + name + "\t" + detail)
+say("14a-ledger-one-row", len(rows) == 1, "%d row(s) in fusion/stats.jsonl" % len(rows))
+row = rows[0] if rows else {}
+missing = [k for k in want_keys if k not in row]
+say("14b-ledger-keys", not missing, "missing keys: %s" % (missing or "none"))
+u = row.get("usage") or {}
+say("14c-ledger-usage", (u.get("input_tokens") or 0) > 0 and (u.get("output_tokens") or 0) > 0,
+    "usage=%s" % json.dumps(u))
+say("14d-ledger-usage-sums", u.get("input_tokens") == side_in and u.get("output_tokens") == side_out,
+    "ledger in/out=%s/%s stub side sum=%s/%s over %d request(s)"
+    % (u.get("input_tokens"), u.get("output_tokens"), side_in, side_out, side_n))
+say("14e-ledger-ok", row.get("outcome") == "ok", "outcome=%s" % row.get("outcome"))
+say("14f-ledger-fresh", row.get("resumed") is False and row.get("idle_secs") is None,
+    "resumed=%s idle_secs=%s" % (row.get("resumed"), row.get("idle_secs")))
+say("14g-ledger-lead-sid", row.get("lead_sid") == sid,
+    "ledger lead_sid=%s lead run sid=%s" % (row.get("lead_sid"), sid))
+say("14h-ledger-requests", (row.get("requests") or 0) >= 1,
+    "requests=%s tools=%s wall=%ss brief=%s report=%s"
+    % (row.get("requests"), row.get("tools"), row.get("wall_secs"),
+       row.get("brief_chars"), row.get("report_chars")))
+say("14i-ledger-effort", row.get("effort") == "max", "ledger effort=%s" % row.get("effort"))
+say("14j-effort-reaches-child", efforts == ["max"],
+    "sidekick child effort seen: %s" % (efforts or "none"))
+print("\n".join(out))
+PY
+    local st name det
+    while IFS=$'\t' read -r st name det; do report "$st" "$name" "$det"; done <"$CASE_DIR/assertions.txt"
+    stop_stub
+}
+
 case_leaddeath() {
     new_case leaddeath
     cat >"$CASE_DIR/script.json" <<'EOF'
@@ -819,6 +907,7 @@ want modelswitch && case_modelswitch
 want background && case_background
 want longhandoff && case_longhandoff
 want cancel && case_cancel
+want ledger && case_ledger
 want leaddeath && case_leaddeath
 want parallel && case_parallel
 want timeoutflow && case_timeoutflow
