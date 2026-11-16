@@ -21,7 +21,8 @@ jobs:
       - name: Check out sibling path dependencies
         shell: bash
         run: |
-          grep -oE 'path *= *"\.\./[^"]+"' Cargo.toml | sed -E 's/.*"(\.\.\/[^"]+)".*/\1/' | while read -r dep; do
+          deps=$(grep -oE 'path *= *"\.\./[^"]+"' Cargo.toml | sed -E 's/.*"(\.\./[^"]+)".*/\1/' || true)
+          for dep in $deps; do
             name=$(basename "$dep")
             [ -d "$dep" ] || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/${name}" "$dep"
           done
