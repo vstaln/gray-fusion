@@ -1,6 +1,6 @@
 [package]
 name = "gray-fusion"
-version = "0.2.0-p2"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Gray Fusion plugin: lead + persistent sidekick orchestration"

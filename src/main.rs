@@ -24,24 +24,27 @@ const LINE_CAP: usize = 1024 * 1024;
 const STDERR_TAIL: usize = 2048;
 
 const LEAD_PROMPT: &str = r#"\
-You have a `handoff` tool: a persistent sidekick subagent that works alongside you on the same machine (shared filesystem and repos; its shell sessions are separate from yours). You are the lead: you own the outcome and the user-facing and authority actions — talking to the user, planning, and directing the sidekick. The user interacts with one agent: you. Unless they explicitly ask about the sidekick, do not mention it or distinguish its work from yours; own the combined result and present it in the first person.
+You have a `handoff` tool: a conversation-persistent sidekick subagent that works alongside you on the same worktree (shared files; each child has separate shell sessions). You are the lead: you own the outcome and the user-facing and authority actions — talking to the user, planning, and directing the sidekick. The user interacts with one agent: you. Unless they explicitly ask about the sidekick, do not mention it or distinguish its work from yours; own the combined result and present it in the first person.
 
-- **Delegate by default** the hands-on work: implementation, verification (builds, lints, type-checks, test runs), environment setup and repair, and broad fan-out searches where you only need the conclusion. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration — author and check those yourself), reviewing the sidekick's diffs, and everything user-facing or authority-bound (commits, pushes, PRs, answering the user).
-- A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait`. Never run the same work yourself in parallel or poll for its result.
-- The sidekick never sees the user's messages or your conversation — it knows only your brief. Write each brief self-contained: the goal, file pointers, your plan, every constraint and hard edge case you know, and the narrowest verification commands that cover the change (it treats your list as mandatory). Specify the code, don't describe it: settle the exact interface, data shape and test cases first; don't leave alternatives for it to pick — it will guess. **Never hand off implementation of an unsettled ask.**
-- It remembers previous handoffs and its runtime state persists (dev servers, background jobs, in-flight commands) — don't re-explain what it already knows. For work involving servers or long-running processes, say what may still be running and whether to leave it up.
+- **Delegate by default** the hands-on work: implementation, verification (builds, lints, type-checks, test runs), environment setup and repair, and broad fan-out searches where you only need the conclusion. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration — author and check those yourself), reviewing the sidekick's diffs, and everything user-facing or authority-bound (commits, pushes, PRs, CI administration, answering the user).
+- A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait`. Never run the same work yourself in parallel. Collect background work with `handoff_wait`. A second handoff while busy is rejected; it does not steer or create another worker. Collect a finished report before dispatching another task.
+- The plugin passes your brief, not the user's messages or your conversation; shared repository files remain accessible. Write each brief self-contained: the goal, file pointers, your plan, every constraint and hard edge case you know, and the narrowest verification commands that cover the change; instruct it to run them. Specify the code, don't describe it: settle the exact interface, data shape and test cases first; do not leave unresolved alternatives for it to pick. **Never hand off implementation of an unsettled ask.**
+- The saved conversation can resume across handoffs; runtime state does not persist by contract. Each attempt starts a new child. The plugin attempts child-tree cleanup; it does not provide a persistent-runtime service. Do not rely on dev servers, background jobs, or in-flight commands surviving: probe and restart them as needed. A failed resumed session may be retried fresh with failure evidence. A cold-resume notice means idle time exceeded 300 seconds, not that a provider cache miss was measured.
 - Never make the sidekick redo work you already did: results you derived go into the brief as settled inputs.
 - A sidekick report is a claim, not a result: its prose is a claim, the artifacts are the evidence. Every report is a landing point — read the full diff and give it a verdict before your next action, and before you accept it run the one check that decides it yourself (the acceptance test, the repro, the suite the task names) and read its output. Never end on "the sidekick says it passes." If it falls short, review the whole output first, then batch every defect and gap, with the exact failing output, into one consolidated rework handoff — not a trickle of small ones.
+
+These are working instructions, not sandbox-enforced permissions or guarantees of model compliance. On failure or timeout the plugin makes one evidence-bearing retry, then tries one higher advertised model tier when available. Exhaustion returns "this needs your hands"; cancellation does not retry. You still decide whether to accept the artifacts.
 
 **Known failure pattern — premature implementation briefing.** There's a natural pull to start writing a brief as soon as you have a plausible idea of what to do. Working solo, you'd catch a wrong assumption as you go; but the sidekick generally executes what you wrote, and changing course afterwards is much harder. Hold your plan to a higher confidence bar: every claim it depends on must be verified or explicitly marked as a hypothesis for the sidekick to verify, and its verification must cover every surface the task touches."#;
 
 const SIDEKICK_CONTRACT: &str = "<sidekick_contract>
-You are the sidekick: a persistent collaborator agent executing task briefs handed off by the lead agent. You do not see the user's messages or the lead's conversation — everything you need is in the brief. Work autonomously with your own tools and verify your work before reporting.
+You are the sidekick: a conversation-persistent collaborator agent executing task briefs handed off by the lead agent. The plugin supplies the brief and your own saved conversation, not the user's messages or the lead's conversation. Shared files are accessible. Your process and shell state are not persistent across handoffs; verify reachability and restart needed processes. Work autonomously with your own tools and verify your work before reporting.
 
-- The lead owns user-facing and authority actions. Do not contact the user, create or update pull requests, commit, or push — for ordinary implementation tasks leave the work tree ready for the lead to review. If the task needs something only the lead or user can do (a secret, information only the user has, a PR action), stop and report what you need instead of working around it.
+- The lead owns user-facing and authority actions. Do not contact the user, create or update pull requests, commit, push, or administer CI — for ordinary implementation tasks leave the work tree ready for the lead to review. If the task needs something only the lead or user can do (a secret, information only the user has, a PR action), stop and report what you need instead of working around it.
 - Git safety: never run destructive or irreversible git commands unless the brief directs it; stage files explicitly (never `git add .`) and never stage files likely to contain secrets.
 - Keep diffs minimal and match the repo's existing conventions; touch only what the task asks for.
-- Report back so it stands alone — the user never sees your output: what you did or found, how you verified it (commands run, results, evidence paths — leave the artifacts in place for the lead to read), any deviations, and anything left for the lead.
+- Report back so it stands alone — the lead receives your report and owns the user-facing answer: what you did or found, how you verified it (commands run, results, evidence paths — leave the artifacts in place for the lead to read), any deviations, and anything left for the lead.
+These instructions do not constitute an OS sandbox. If the brief conflicts with the lead-owned authority boundary, report the conflict rather than acting.
 </sidekick_contract>
 
 This is your first handoff from the lead. Work it to completion, then end your final message with a concise report of what you did, the evidence (diffs, test output), and anything you need from the lead.
@@ -206,8 +209,10 @@ fn load_auth_keys(home: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+#[derive(Clone)]
 struct Active {
     sidekick: String,
+    lead_model: String,
 }
 
 fn active_from_model(m: &Value) -> Option<Active> {
@@ -240,6 +245,7 @@ fn active_from_model(m: &Value) -> Option<Active> {
     };
     Some(Active {
         sidekick: qualified,
+        lead_model: parts.get("lead").cloned().unwrap_or_default(),
     })
 }
 
@@ -287,6 +293,7 @@ fn active(session: Option<&Value>) -> Option<Active> {
     };
     Some(Active {
         sidekick: qualified,
+        lead_model: parts.get("lead").cloned().unwrap_or_default(),
     })
 }
 
@@ -451,7 +458,142 @@ fn session_idle_secs(home: &Path, lead: &str, qualified: &str) -> Option<u64> {
     now.duration_since(modified).ok().map(|d| d.as_secs())
 }
 
+fn model_tier(model: &str) -> Option<(&'static str, u8)> {
+    let model = model.to_ascii_lowercase();
+    if model.contains("claude") {
+        for (name, tier) in [("haiku", 0), ("sonnet", 1), ("opus", 2)] {
+            if model.contains(name) {
+                return Some(("claude", tier));
+            }
+        }
+    }
+    if model.contains("gemini") {
+        for (name, tier) in [("flash-lite", 0), ("flash", 1), ("pro", 2)] {
+            if model.contains(name) {
+                return Some(("gemini", tier));
+            }
+        }
+    }
+    None
+}
+
+fn prompt_variant(lead: &str, side: &str) -> &'static str {
+    match (model_tier(lead), model_tier(side)) {
+        (Some((_, l)), Some((_, s))) if l > s => "budget-worker-v1",
+        (Some((_, l)), Some((_, s))) if l < s => "expert-worker-v1",
+        _ => "default-v1",
+    }
+}
+
+fn pairing_note(variant: &str) -> &'static str {
+    match variant {
+        "budget-worker-v1" => {
+            "Pairing policy: give the worker a narrow implementation slice, settled interfaces, explicit file paths and a decisive verification command. Return evidence and blockers, not a new design. The lead adjudicates all ambiguous results."
+        }
+        "expert-worker-v1" => {
+            "Pairing policy: use the worker's stronger analysis for bounded implementation and verification. State acceptance criteria and constraints without dictating unverified internals. The worker must expose assumptions and reproducible evidence; authority stays with the lead."
+        }
+        _ => "",
+    }
+}
+
+fn next_tier(qualified: &str) -> Option<String> {
+    let (token, model) = qualified.split_once(':')?;
+    let (family, tier) = model_tier(model)?;
+    let mut candidates = Vec::new();
+    for home in [gray_home(), user_home()] {
+        let text = std::fs::read_to_string(home.join("provider_models.json")).ok();
+        let map = text.and_then(|t| serde_json::from_str::<BTreeMap<String, Value>>(&t).ok());
+        for (key, value) in map.unwrap_or_default() {
+            if provider_token(&key) != token {
+                continue;
+            }
+            let rows = value.get("rows").unwrap_or(&value);
+            for row in rows.as_array().into_iter().flatten() {
+                if row.get("slots").is_some() {
+                    continue;
+                }
+                let id = row.get("id").or_else(|| row.get(0)).and_then(Value::as_str);
+                if let Some(id) = id
+                    && model_tier(id) == Some((family, tier + 1))
+                {
+                    candidates.push(format!("{token}:{id}"));
+                }
+            }
+        }
+    }
+    candidates.sort();
+    candidates.pop()
+}
+
+#[derive(serde::Serialize, Clone, Copy)]
+struct BriefSignals {
+    has_artifact: bool,
+    has_verification: bool,
+}
+
+fn brief_signals(task: &str) -> BriefSignals {
+    let lower = task.to_ascii_lowercase();
+    let has_verification = [
+        "cargo check",
+        "cargo test",
+        "cargo clippy",
+        "npm test",
+        "npm run",
+        "pnpm test",
+        "pytest",
+        "go test",
+        "make check",
+        "bash e2e/",
+        "tsc --",
+        "curl ",
+    ]
+    .iter()
+    .any(|command| lower.contains(command));
+    let has_artifact = has_verification
+        || task.contains("```")
+        || task.split_whitespace().any(|word| {
+            word.contains('/')
+                || [".rs", ".py", ".ts", ".tsx", ".json", ".sh", ".md", ".txt"]
+                    .iter()
+                    .any(|ext| word.contains(ext))
+        });
+    BriefSignals {
+        has_artifact,
+        has_verification,
+    }
+}
+
+fn cold_notice(idle: Option<u64>) -> String {
+    match idle {
+        Some(seconds) if seconds > 300 => format!(
+            "cold resume: conversation idle for {seconds}s; provider cache retention is unknown. Reuse saved conclusions; probe processes before restarting them.\n\n"
+        ),
+        _ => String::new(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Attempt {
+    rung: &'static str,
+    model: String,
+    prompt_variant: &'static str,
+    outcome: &'static str,
+    wall_secs: f64,
+    usage: Value,
+    requests: u64,
+    tools: u64,
+}
+
 struct Ledger<'a> {
+    handoff_id: &'a str,
+    lead_model: &'a str,
+    prompt_variant: &'a str,
+    final_sidekick: &'a str,
+    escalation_rung: &'a str,
+    resolution: &'a str,
+    attempts: &'a [Attempt],
+    brief_signals: BriefSignals,
     lead: &'a str,
     qualified: &'a str,
     effort: Option<String>,
@@ -485,6 +627,14 @@ fn write_ledger(home: &Path, row: &Ledger) {
         .unwrap_or(0);
     let line = json!({
         "ts": ts,
+        "handoff_id": row.handoff_id,
+        "lead_model": row.lead_model,
+        "prompt_variant": row.prompt_variant,
+        "final_sidekick": row.final_sidekick,
+        "escalation_rung": row.escalation_rung,
+        "resolution": row.resolution,
+        "attempts": row.attempts,
+        "brief_signals": row.brief_signals,
         "lead_sid": row.lead,
         "sidekick": row.qualified,
         "effort": row.effort,
@@ -503,75 +653,209 @@ fn write_ledger(home: &Path, row: &Ledger) {
     let _ = f.write_all(format!("{line}\n").as_bytes());
 }
 
+fn row_tokens(row: &Value) -> u64 {
+    ["input_tokens", "output_tokens"]
+        .iter()
+        .map(|key| {
+            row.get("usage")
+                .and_then(|u| u.get(*key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn cohort(rows: &[&Value]) -> String {
+    let ok = rows
+        .iter()
+        .filter(|r| r.get("outcome").and_then(Value::as_str) == Some("ok"))
+        .count();
+    let tokens: u64 = rows.iter().map(|r| row_tokens(r)).sum();
+    let per_completed = if ok == 0 {
+        "n/a".into()
+    } else {
+        format!("{:.0}", tokens as f64 / ok as f64)
+    };
+    let wall: f64 = rows
+        .iter()
+        .map(|r| r.get("wall_secs").and_then(Value::as_f64).unwrap_or(0.0))
+        .sum();
+    format!(
+        "n={} ok={ok} tokens={tokens} tokens/completed={per_completed} mean_wall={:.1}s",
+        rows.len(),
+        wall / rows.len().max(1) as f64
+    )
+}
+
 fn fusion_stats(argv: &[String], sid: &str) -> String {
-    let all = argv.iter().any(|a| a == "--all");
+    let all = argv.iter().any(|a| a == "--all") || sid.is_empty();
     let path = gray_home().join("fusion/stats.jsonl");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if !all && v.get("lead_sid").and_then(|s| s.as_str()) != Some(sid) {
-            continue;
-        }
-        rows.push(v);
-    }
+    let rows: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| {
+            v.is_object() && (all || v.get("lead_sid").and_then(Value::as_str) == Some(sid))
+        })
+        .collect();
     let scope = if all {
         "all sessions".to_string()
     } else {
-        format!("session {}", if sid.is_empty() { "-" } else { sid })
+        format!("session {sid}")
     };
+    if argv.first().is_some_and(|a| a == "compare") {
+        let variants: Vec<&str> = argv
+            .iter()
+            .skip(1)
+            .filter(|a| !a.starts_with("--"))
+            .map(String::as_str)
+            .collect();
+        if variants.len() != 2 {
+            return "usage: fusion compare <variant-a> <variant-b> [--all]\nCompares recorded handoffs, not benchmark runs or dollar costs.".into();
+        }
+        let mut out = format!(
+            "fusion compare: {scope}\nvariant | recorded handoffs (all attempted work included in tokens/completed)\n"
+        );
+        for variant in variants {
+            let selected: Vec<&Value> = rows
+                .iter()
+                .filter(|r| r.get("prompt_variant").and_then(Value::as_str) == Some(variant))
+                .collect();
+            out.push_str(&format!("{variant} | {}\n", cohort(&selected)));
+        }
+        out.push_str("Observational token proxy, not dollar savings or a causal benchmark. Pairings and task difficulty may differ; zero completed handoffs yields n/a.");
+        return out;
+    }
     if rows.is_empty() {
         return format!("fusion stats: no handoffs recorded ({scope})");
     }
-    let mut ok = 0;
-    let mut failed = 0;
-    let mut timeout = 0;
-    let mut cancelled = 0;
+    let mut outcomes = BTreeMap::<String, usize>::new();
+    let mut rungs = BTreeMap::<String, usize>::new();
+    let mut attempt_rungs = BTreeMap::<String, usize>::new();
+    let mut groups = BTreeMap::<(String, String, String), Vec<&Value>>::new();
+    let mut briefs = BTreeMap::<String, Vec<&Value>>::new();
+    let mut tokens = [0u64; 5];
     let mut cold = 0;
     let mut wall = 0.0;
-    let mut tokens = [0u64; 5];
     for row in &rows {
-        match row.get("outcome").and_then(|o| o.as_str()) {
-            Some("ok") => ok += 1,
-            Some("timeout") => timeout += 1,
-            Some("cancelled") => cancelled += 1,
-            _ => failed += 1,
-        }
-        if row
-            .get("idle_secs")
-            .and_then(|i| i.as_u64())
-            .is_some_and(|i| i > 300)
+        *outcomes.entry(str_field(row, "outcome")).or_default() += 1;
+        let rung = row
+            .get("escalation_rung")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy");
+        *rungs.entry(rung.into()).or_default() += 1;
+        for attempt in row
+            .get("attempts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
         {
-            cold += 1;
+            *attempt_rungs.entry(str_field(attempt, "rung")).or_default() += 1;
         }
-        wall += row.get("wall_secs").and_then(|w| w.as_f64()).unwrap_or(0.0);
-        if let Some(u) = row.get("usage") {
-            for (i, key) in [
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_write_input_tokens",
-                "reasoning_tokens",
-            ]
-            .iter()
-            .enumerate()
+        let variant = row
+            .get("prompt_variant")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy-unattributed");
+        groups
+            .entry((
+                str_field(row, "lead_model"),
+                str_field(row, "sidekick"),
+                variant.into(),
+            ))
+            .or_default()
+            .push(row);
+        let signal = row.get("brief_signals");
+        let bucket = match signal {
+            None => "unknown",
+            Some(s)
+                if s.get("has_artifact").and_then(Value::as_bool) == Some(true)
+                    && s.get("has_verification").and_then(Value::as_bool) == Some(true) =>
             {
-                tokens[i] += u.get(*key).and_then(|t| t.as_u64()).unwrap_or(0);
+                "structured"
             }
+            Some(s) if s.get("has_artifact").and_then(Value::as_bool) == Some(true) => {
+                "artifact-only"
+            }
+            _ => "unstructured",
+        };
+        briefs.entry(bucket.into()).or_default().push(row);
+        cold += usize::from(
+            row.get("idle_secs")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| i > 300),
+        );
+        wall += row.get("wall_secs").and_then(Value::as_f64).unwrap_or(0.0);
+        for (i, key) in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_tokens",
+        ]
+        .iter()
+        .enumerate()
+        {
+            tokens[i] += row
+                .get("usage")
+                .and_then(|u| u.get(*key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
         }
     }
-    let n = rows.len();
-    format!(
-        "fusion stats: {scope}\n         handoffs: {n}\n         outcomes: ok={ok} failed={failed} timeout={timeout} cancelled={cancelled}\n         sidekick tokens: input={} output={} cache_read={} cache_write={} reasoning={}\n         cold resumes (idle > 300s): {cold}\n         mean wall: {:.1}s",
+    let count = |key: &str| outcomes.get(key).copied().unwrap_or(0);
+    let mut out = format!(
+        "fusion stats: {scope}\nhandoffs: {}\noutcomes: ok={} failed={} timeout={} cancelled={}\nsidekick tokens: input={} output={} cache_read={} cache_write={} reasoning={}\ncold resumes (idle > 300s): {cold}\nmean wall: {:.1}s\nescalation rungs: {}\n",
+        rows.len(),
+        count("ok"),
+        count("failed"),
+        count("timeout"),
+        count("cancelled"),
         tokens[0],
         tokens[1],
         tokens[2],
         tokens[3],
         tokens[4],
-        wall / n as f64
-    )
+        wall / rows.len() as f64,
+        rungs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    out.push_str(&format!(
+        "executed attempt rungs: {}\n",
+        attempt_rungs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    for ((lead, side, variant), selected) in groups {
+        out.push_str(&format!(
+            "pairing {lead} -> {side} | {variant}: {}\n",
+            cohort(&selected)
+        ));
+    }
+    for (bucket, selected) in briefs {
+        let failed = selected
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.get("outcome").and_then(Value::as_str),
+                    Some("failed" | "timeout")
+                )
+            })
+            .count();
+        out.push_str(&format!(
+            "brief {bucket}: n={} failed_or_timeout={failed} rate={:.1}%\n",
+            selected.len(),
+            100.0 * failed as f64 / selected.len() as f64
+        ));
+    }
+    out.push_str(
+        "Brief signals are lexical observations, not a quality score or evidence of causation.",
+    );
+    out
 }
 
 fn handoff_timeout() -> Duration {
@@ -631,7 +915,9 @@ fn last_reports() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+#[derive(Default)]
 struct Pump {
+    completed: bool,
     session_id: Option<String>,
     text: String,
     error: Option<String>,
@@ -698,6 +984,7 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
     }
     match row.get("type").and_then(|v| v.as_str()) {
         Some("result") => {
+            pump.completed = true;
             if let Some(t) = row.get("text").and_then(|v| v.as_str()) {
                 pump.text = t.to_string();
             }
@@ -705,7 +992,7 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
                 pump.usage.set_json(u);
             }
             if let Some(n) = row.pointer("/accounting/requests").and_then(|v| v.as_u64()) {
-                pump.requests += n;
+                pump.requests = pump.requests.max(n);
             }
         }
         Some("error") => {
@@ -720,6 +1007,7 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
         }
         Some("progress") => {
             match row.get("phase").and_then(|v| v.as_str()) {
+                Some("request") => pump.requests += 1,
                 Some("text") => {
                     if let Some(t) = row.get("text").and_then(|v| v.as_str()) {
                         pump.last_text.push_str(t);
@@ -857,6 +1145,7 @@ struct RunCtx<'a> {
     lead: &'a str,
     qualified: &'a str,
     effort: Option<&'a str>,
+    variant: &'static str,
 }
 
 fn run_child(
@@ -870,21 +1159,19 @@ fn run_child(
     let home = ctx.home;
     let lead = ctx.lead;
     let qualified = ctx.qualified;
-    let mut pump = Pump {
-        session_id: None,
-        text: String::new(),
-        error: None,
-        killed: false,
-        usage: Usage::default(),
-        requests: 0,
-        tools: 0,
-        last_text: String::new(),
-        last_tools: Vec::new(),
-    };
+    let mut pump = Pump::default();
+    if slot.cancel.load(Ordering::SeqCst) {
+        pump.killed = true;
+        pump.error = Some("handoff cancelled".into());
+        return pump;
+    }
     let timeout = handoff_timeout();
     let task_owned;
     let task = if session.is_none() {
-        task_owned = format!("{SIDEKICK_CONTRACT}\n{task}\n</lead_handoff>");
+        task_owned = format!(
+            "{SIDEKICK_CONTRACT}\n{}\n{task}\n</lead_handoff>",
+            pairing_note(ctx.variant)
+        );
         task_owned.as_str()
     } else {
         task
@@ -944,6 +1231,7 @@ fn run_child(
     slot.pgid.store(pid, Ordering::SeqCst);
     let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         pump.error = Some("sidekick spawn failed: no pipes".into());
+        kill_tree(slot, &mut child, pid);
         return pump;
     };
     let stderr_task = std::thread::spawn(move || {
@@ -984,10 +1272,17 @@ fn run_child(
         if slot.cancel.load(Ordering::SeqCst) {
             break Done::Killed("handoff cancelled");
         }
-        match rx.recv_timeout(Duration::from_millis(200)) {
+        if Instant::now() >= deadline {
+            break Done::Killed("handoff timed out");
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            force_kill_tree(pid);
+            sweep_tagged(&slot.handoff_id);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
                 let line = if line.len() > LINE_CAP {
-                    &line[..LINE_CAP]
+                    &line[..line.floor_char_boundary(LINE_CAP)]
                 } else {
                     &line
                 };
@@ -1010,9 +1305,11 @@ fn run_child(
         kill_tree(slot, &mut child, pid);
         pump.killed = true;
         pump.error = Some(msg.into());
+        let _ = reader.join();
+        let _ = stderr_task.join();
+        slot.pgid.store(0, Ordering::SeqCst);
         return pump;
     }
-    let _ = reader.join();
     let deadline2 = Instant::now() + REAP_GRACE;
     let status = loop {
         match child.try_wait() {
@@ -1027,6 +1324,10 @@ fn run_child(
             Err(_) => break None,
         }
     };
+    force_kill_tree(pid);
+    sweep_tagged(&slot.handoff_id);
+    slot.pgid.store(0, Ordering::SeqCst);
+    let _ = reader.join();
     let stderr_tail = stderr_task.join().unwrap_or_default();
     match status {
         Some(s) if !s.success() && pump.error.is_none() => {
@@ -1046,6 +1347,9 @@ fn run_child(
             pump.error = Some("sidekick did not exit".into());
         }
         _ => {}
+    }
+    if !pump.completed && pump.error.is_none() {
+        pump.error = Some("sidekick exited without a result row".into());
     }
     pump
 }
@@ -1073,116 +1377,166 @@ fn partial_report(pump: &Pump) -> String {
     parts.join("\n\n")
 }
 
-fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified: &str) -> Value {
+fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, active: &Active) -> Value {
     let started = Instant::now();
     let home = gray_home();
     let effort = sidekick_effort();
-    let Some(spec) = resolve_sidekick(qualified) else {
-        let content = format!("cannot resolve sidekick model '{qualified}'");
-        write_ledger(
-            &home,
-            &Ledger {
-                lead,
-                qualified,
-                effort,
-                resumed: false,
-                retried_fresh: false,
-                idle_secs: None,
-                outcome: "failed",
-                wall_secs: started.elapsed().as_secs_f64(),
-                brief_chars: task.chars().count(),
-                report_chars: content.chars().count(),
-                usage: Usage::default(),
-                requests: 0,
-                tools: 0,
-            },
-        );
-        return json!({
-            "content": content,
-            "is_error": true,
-        });
-    };
-    let session = read_session(&home, lead, qualified);
-    let resumed = session.is_some();
-    let idle_secs = if resumed {
-        session_idle_secs(&home, lead, qualified)
-    } else {
-        None
-    };
-    let ctx = RunCtx {
-        cwd,
-        home: &home,
-        lead,
-        qualified,
-        effort: effort.as_deref(),
-    };
-    let pump = run_child(slot, &spec, task, session.as_deref(), &ctx);
+    let qualified = &active.sidekick;
+    let resumed = read_session(&home, lead, qualified).is_some();
+    let idle_secs = resumed
+        .then(|| session_idle_secs(&home, lead, qualified))
+        .flatten();
+    let variant = prompt_variant(&active.lead_model, qualified);
+    let mut model = qualified.clone();
+    let mut brief = task.to_string();
+    let mut evidence = Vec::new();
+    let mut attempts = Vec::new();
+    let mut total = Usage::default();
+    let mut requests = 0;
+    let mut tools = 0;
     let mut retried_fresh = false;
-    let pump = if pump.error.is_some() && !pump.killed && resumed {
-        retried_fresh = true;
-        drop_session(&home, lead, qualified);
-        let mut retry = run_child(slot, &spec, task, None, &ctx);
-        retry.usage.input_tokens += pump.usage.input_tokens;
-        retry.usage.output_tokens += pump.usage.output_tokens;
-        retry.usage.cache_read_input_tokens += pump.usage.cache_read_input_tokens;
-        retry.usage.cache_write_input_tokens += pump.usage.cache_write_input_tokens;
-        retry.usage.reasoning_tokens += pump.usage.reasoning_tokens;
-        retry.requests += pump.requests;
-        retry.tools += pump.tools;
-        retry
-    } else {
-        pump
-    };
-    let timeout_secs = handoff_timeout().as_secs();
-    let outcome = if pump.killed {
-        if pump.error.as_deref() == Some("handoff cancelled") {
-            "cancelled"
+    let mut rung = "initial";
+    let mut outcome = "failed";
+    let mut report = String::new();
+    let mut terminal_reason = String::new();
+    for index in 0..3 {
+        let attempt_start = Instant::now();
+        let session = if index == 2 {
+            None
         } else {
-            "timeout"
-        }
-    } else if pump.error.is_some() {
-        "failed"
-    } else {
-        "ok"
-    };
-    let reply = if pump.killed {
-        let sid = pump.session_id.clone().unwrap_or_else(|| "none".into());
-        let cancelled = pump.error.as_deref() == Some("handoff cancelled");
-        let mut content = if cancelled {
-            format!("handoff cancelled; sidekick session {sid} kept and will resume")
-        } else {
-            format!(
-                "handoff timed out after {timeout_secs}s; sidekick session {sid} kept and will resume"
-            )
+            read_session(&home, lead, &model)
         };
-        let partial = partial_report(&pump);
-        if !partial.is_empty() {
-            content.push_str("\n\n");
-            content.push_str(&partial);
+        let attempt_variant = prompt_variant(&active.lead_model, &model);
+        let spec = resolve_sidekick(&model);
+        let pump = match &spec {
+            Some(spec) => run_child(
+                slot,
+                spec,
+                &brief,
+                session.as_deref(),
+                &RunCtx {
+                    cwd,
+                    home: &home,
+                    lead,
+                    qualified: &model,
+                    effort: effort.as_deref(),
+                    variant: attempt_variant,
+                },
+            ),
+            None => Pump {
+                error: Some(format!("cannot resolve sidekick model '{model}'")),
+                ..Pump::default()
+            },
+        };
+        outcome = if slot.cancel.load(Ordering::SeqCst)
+            || pump.error.as_deref() == Some("handoff cancelled")
+        {
+            "cancelled"
+        } else if pump.killed {
+            "timeout"
+        } else if pump.error.is_some() {
+            "failed"
+        } else {
+            "ok"
+        };
+        total.add_json(&pump.usage.to_json());
+        requests += pump.requests;
+        tools += pump.tools;
+        attempts.push(Attempt {
+            rung,
+            model: model.clone(),
+            prompt_variant: attempt_variant,
+            outcome,
+            wall_secs: attempt_start.elapsed().as_secs_f64(),
+            usage: pump.usage.to_json(),
+            requests: pump.requests,
+            tools: pump.tools,
+        });
+        if let Some(sid) = &pump.session_id {
+            write_session(&home, lead, &model, sid);
         }
-        json!({
-            "content": content,
-            "is_error": true,
-            "usage": pump.usage.to_json(),
-        })
-    } else if let Some(err) = pump.error {
-        json!({
-            "content": format!("handoff failed: {err}"),
-            "is_error": true,
-            "usage": pump.usage.to_json(),
-        })
+        if outcome == "ok" {
+            report = pump.text;
+            if index > 0 {
+                report.push_str(&format!(
+                    "\n\nRecovered on {rung}. Prior failure evidence:\n{}",
+                    evidence.join("\n\n")
+                ));
+            }
+            break;
+        }
+        let detail = format!(
+            "{rung}: {outcome}: {}\n{}",
+            pump.error.as_deref().unwrap_or("handoff cancelled"),
+            partial_report(&pump)
+        );
+        evidence.push(detail.chars().take(3000).collect::<String>());
+        if outcome == "cancelled" {
+            let retention = if read_session(&home, lead, &model).is_some() {
+                "session kept and will resume"
+            } else {
+                "no saved session is available"
+            };
+            report = format!(
+                "handoff cancelled; {retention}\n\n{}",
+                evidence.join("\n\n")
+            );
+            break;
+        }
+        if spec.is_none() {
+            terminal_reason = "provider/model resolution is unavailable".into();
+            break;
+        }
+        if index == 0 {
+            if !pump.killed && resumed {
+                drop_session(&home, lead, &model);
+                retried_fresh = true;
+            }
+            rung = "repair";
+        } else if index == 1 {
+            if let Some(next) = next_tier(&model) {
+                model = next;
+                rung = "tier";
+            } else {
+                terminal_reason = "no next model tier is advertised by this provider; no model name or credential was invented".into();
+                break;
+            }
+        }
+        brief = format!(
+            "{task}\n\n<failure_evidence>\n{}\n</failure_evidence>\nCorrect the evidenced failure, inspect artifacts before repeating work, and run the brief's verification. Do not repeat an unchanged failing approach. Report a blocker if the lead's decision is required.",
+            evidence.join("\n\n")
+        );
+    }
+    let resolution = if outcome == "ok" {
+        "complete"
+    } else if outcome == "cancelled" {
+        "cancelled"
     } else {
-        json!({
-            "content": pump.text,
-            "is_error": false,
-            "usage": pump.usage.to_json(),
-        })
+        "needs_lead"
     };
+    if resolution == "needs_lead" {
+        rung = "needs_lead";
+        report = format!(
+            "this needs your hands: handoff {outcome} after {} attempt(s). {terminal_reason}\n\n{}",
+            attempts.len(),
+            evidence.join("\n\n")
+        );
+    }
+    report = format!("{}{report}", cold_notice(idle_secs));
+    let reply = json!({"content": report, "is_error": outcome != "ok", "usage": total.to_json()});
     write_ledger(
         &home,
         &Ledger {
+            handoff_id: &slot.handoff_id,
             lead,
+            lead_model: &active.lead_model,
             qualified,
+            prompt_variant: variant,
+            final_sidekick: &model,
+            escalation_rung: rung,
+            resolution,
+            attempts: &attempts,
+            brief_signals: brief_signals(task),
             effort,
             resumed,
             retried_fresh,
@@ -1190,14 +1544,10 @@ fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified:
             outcome,
             wall_secs: started.elapsed().as_secs_f64(),
             brief_chars: task.chars().count(),
-            report_chars: reply
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(|c| c.chars().count())
-                .unwrap_or(0),
-            usage: pump.usage,
-            requests: pump.requests,
-            tools: pump.tools,
+            report_chars: report.chars().count(),
+            usage: total,
+            requests,
+            tools,
         },
     );
     let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1206,6 +1556,16 @@ fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified:
     drop(st);
     slot.done.notify_all();
     reply
+}
+
+fn remove_slot(lead: &str, slot: &Arc<Slot>) {
+    let mut map = slots();
+    if map
+        .get(lead)
+        .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        map.remove(lead);
+    }
 }
 
 fn tool_call(params: &Value) -> Value {
@@ -1254,25 +1614,23 @@ fn tool_call(params: &Value) -> Value {
                 let mut map = slots();
                 if let Some(prev) = map.get(&lead) {
                     let st = prev.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if !st.finished {
-                        return json!({
-                            "content": "sidekick busy; call handoff_wait",
-                            "is_error": true,
-                        });
-                    }
+                    return json!({
+                        "content": if st.finished { "sidekick report ready; call handoff_wait to collect it" } else { "sidekick busy; call handoff_wait" },
+                        "is_error": true,
+                    });
                 }
                 map.insert(lead.clone(), slot.clone());
             }
-            let qualified = active.sidekick.clone();
+            let notice = cold_notice(session_idle_secs(&gray_home(), &lead, &active.sidekick));
             let pump_slot = slot.clone();
             let cwd2 = cwd.clone();
             let lead2 = lead.clone();
             std::thread::spawn(move || {
-                pump_handoff(&pump_slot, &task, &cwd2, &lead2, &qualified);
+                pump_handoff(&pump_slot, &task, &cwd2, &lead2, &active);
             });
             if !block {
                 return json!({
-                    "content": format!("handoff {} running in background; call handoff_wait to collect the report", slot.handoff_id),
+                    "content": format!("{notice}handoff {} running in background; call handoff_wait to collect the report", slot.handoff_id),
                     "is_error": false,
                 });
             }
@@ -1285,7 +1643,7 @@ fn tool_call(params: &Value) -> Value {
                 .take()
                 .unwrap_or(json!({"content":"", "is_error":false}));
             drop(st);
-            slots().remove(&lead);
+            remove_slot(&lead, &slot);
             if let Some(c) = reply.get("content").and_then(|v| v.as_str()) {
                 last_reports().insert(lead.clone(), c.to_string());
             }
@@ -1328,7 +1686,7 @@ fn tool_call(params: &Value) -> Value {
                 .take()
                 .unwrap_or(json!({"content":"", "is_error":false}));
             drop(st);
-            slots().remove(&lead);
+            remove_slot(&lead, &slot);
             if let Some(c) = reply.get("content").and_then(|v| v.as_str()) {
                 last_reports().insert(lead.clone(), c.to_string());
             }
@@ -1341,12 +1699,17 @@ fn tool_call(params: &Value) -> Value {
     }
 }
 
-fn tool_defs() -> Vec<Value> {
+fn tool_defs(active: &Active) -> Vec<Value> {
+    let variant = prompt_variant(&active.lead_model, &active.sidekick);
+    let prompt = format!(
+        "{LEAD_PROMPT}\n\nPrompt variant: {variant}\n{}",
+        pairing_note(variant)
+    );
     vec![
         json!({
             "name": "handoff",
             "label": "handoff",
-            "description": LEAD_PROMPT,
+            "description": prompt,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1378,7 +1741,7 @@ fn manifest() -> Value {
         "protocol": "1.3",
         "tools": [],
         "commands": ["/fusion"],
-        "command_descriptions": {"/fusion": "sidekick handoff ledger: stats [--all]"},
+        "command_descriptions": {"/fusion": "sidekick ledger: stats [--all]; compare <variant-a> <variant-b> [--all]"},
         "composite_rows": [{
             "id": "gray-fusion",
             "name": "Fusion",
@@ -1423,11 +1786,24 @@ fn reply(id: u64, result: Value) {
     let _ = g.flush();
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let arg = std::env::args().nth(1);
     if arg.as_deref() == Some("manifest") {
         println!("{}", manifest());
-        return;
+        return Ok(());
+    }
+    if matches!(arg.as_deref(), Some("stats" | "compare")) {
+        println!(
+            "{}",
+            fusion_stats(&std::env::args().skip(1).collect::<Vec<_>>(), "")
+        );
+        return Ok(());
+    }
+    if matches!(arg.as_deref(), Some("--help" | "-h")) {
+        println!(
+            "gray-fusion: lead + conversation-persistent sidekick\nCommands: manifest; stats [--all]; compare <variant-a> <variant-b> [--all]\nTools: handoff, handoff_wait. Busy calls are rejected, not steering.\nFailure ladder: initial -> evidence repair -> one advertised tier -> lead.\nTimeout applies per attempt (at most three); cancellation never retries.\nChild processes are not persistent. Cold means idle >300s, not a measured cache miss."
+        );
+        return Ok(());
     }
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -1459,16 +1835,9 @@ fn main() {
                     .and_then(|p| p.get("session"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                eprintln!(
-                    "fusion probe: tools req session={}",
-                    &sess.to_string()[..sess.to_string().len().min(300)]
-                );
-                eprintln!("fusion probe: active={}", active(Some(&sess)).is_some());
-                let tools = if active(Some(&sess)).is_some() {
-                    tool_defs()
-                } else {
-                    Vec::new()
-                };
+                let tools = active(Some(&sess))
+                    .map(|a| tool_defs(&a))
+                    .unwrap_or_default();
                 reply(id, json!({"tools": tools}));
             }
             Some("command/run") => {
@@ -1512,4 +1881,5 @@ fn main() {
         }
     }
     shutdown_drain();
+    Ok(())
 }
