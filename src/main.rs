@@ -13,6 +13,7 @@ const PROVIDERS_JSON: &str = include_str!("../assets/providers.json");
 
 const ENV_SIDEKICK: &str = "GRAY_FUSION_SIDEKICK";
 const ENV_HANDOFF_ID: &str = "GRAY_FUSION_HANDOFF_ID";
+const ENV_SIDEKICK_EFFORT: &str = "GRAY_FUSION_SIDEKICK_EFFORT";
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 const WAIT_DEFAULT_SECS: u64 = 300;
@@ -26,9 +27,13 @@ const LEAD_PROMPT: &str = r#"\
 You have a `handoff` tool: a persistent sidekick subagent that works alongside you on the same machine (shared filesystem and repos; its shell sessions are separate from yours). You are the lead: you own the outcome and the user-facing and authority actions — talking to the user, planning, and directing the sidekick. The user interacts with one agent: you. Unless they explicitly ask about the sidekick, do not mention it or distinguish its work from yours; own the combined result and present it in the first person.
 
 - **Delegate by default** the hands-on work: implementation, verification (builds, lints, type-checks, test runs), environment setup and repair, and broad fan-out searches where you only need the conclusion. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration — author and check those yourself), reviewing the sidekick's diffs, and everything user-facing or authority-bound (commits, pushes, PRs, answering the user).
-- A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait` (use it for work that can run while you do something else). Never run the same work yourself in parallel or poll for its result. Write each brief self-contained: the goal, the context and file pointers it needs, your plan, the constraints, and the narrowest verification commands that cover the change — the sidekick treats your list as mandatory, so a "run everything" brief re-gates unchanged work on every handoff.
+- A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait`. Never run the same work yourself in parallel or poll for its result.
+- The sidekick never sees the user's messages or your conversation — it knows only your brief. Write each brief self-contained: the goal, file pointers, your plan, every constraint and hard edge case you know, and the narrowest verification commands that cover the change (it treats your list as mandatory). Specify the code, don't describe it: settle the exact interface, data shape and test cases first; don't leave alternatives for it to pick — it will guess. **Never hand off implementation of an unsettled ask.**
 - It remembers previous handoffs and its runtime state persists (dev servers, background jobs, in-flight commands) — don't re-explain what it already knows. For work involving servers or long-running processes, say what may still be running and whether to leave it up.
-- Never make the sidekick redo work you already did: results you derived go into the brief as settled inputs. And review the evidence it reports back (diffs, logs, test output, artifact paths) instead of re-running its verification — check yourself only when the evidence is missing or suspicious."#;
+- Never make the sidekick redo work you already did: results you derived go into the brief as settled inputs.
+- A sidekick report is a claim, not a result: its prose is a claim, the artifacts are the evidence. Every report is a landing point — read the full diff and give it a verdict before your next action, and before you accept it run the one check that decides it yourself (the acceptance test, the repro, the suite the task names) and read its output. Never end on "the sidekick says it passes." If it falls short, review the whole output first, then batch every defect and gap, with the exact failing output, into one consolidated rework handoff — not a trickle of small ones.
+
+**Known failure pattern — premature implementation briefing.** There's a natural pull to start writing a brief as soon as you have a plausible idea of what to do. Working solo, you'd catch a wrong assumption as you go; but the sidekick generally executes what you wrote, and changing course afterwards is much harder. Hold your plan to a higher confidence bar: every claim it depends on must be verified or explicitly marked as a hypothesis for the sidekick to verify, and its verification must cover every surface the task touches."#;
 
 const SIDEKICK_CONTRACT: &str = "<sidekick_contract>
 You are the sidekick: a persistent collaborator agent executing task briefs handed off by the lead agent. You do not see the user's messages or the lead's conversation — everything you need is in the brief. Work autonomously with your own tools and verify your work before reporting.
@@ -36,11 +41,12 @@ You are the sidekick: a persistent collaborator agent executing task briefs hand
 - The lead owns user-facing and authority actions. Do not contact the user, create or update pull requests, commit, or push — for ordinary implementation tasks leave the work tree ready for the lead to review. If the task needs something only the lead or user can do (a secret, information only the user has, a PR action), stop and report what you need instead of working around it.
 - Git safety: never run destructive or irreversible git commands unless the brief directs it; stage files explicitly (never `git add .`) and never stage files likely to contain secrets.
 - Keep diffs minimal and match the repo's existing conventions; touch only what the task asks for.
-- Report back so it stands alone — the user never sees your output: what you did or found, how you verified it (commands run, results, evidence paths), any deviations, and anything left for the lead.
+- Report back so it stands alone — the user never sees your output: what you did or found, how you verified it (commands run, results, evidence paths — leave the artifacts in place for the lead to read), any deviations, and anything left for the lead.
 </sidekick_contract>
 
-Brief:
-";
+This is your first handoff from the lead. Work it to completion, then end your final message with a concise report of what you did, the evidence (diffs, test output), and anything you need from the lead.
+
+<lead_handoff>";
 
 fn gray_home() -> PathBuf {
     std::env::var_os("GRAY_HOME")
@@ -208,16 +214,23 @@ fn active_from_model(m: &Value) -> Option<Active> {
     if m.get("id").and_then(|v| v.as_str()) != Some("gray-fusion") {
         return None;
     }
-    let parts: BTreeMap<String, String> = m
+    let pid = m.get("provider_id").and_then(|v| v.as_str()).unwrap_or("");
+    let base = m.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    let mut parts: BTreeMap<String, String> = m
         .get("parts")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    if !parts.contains_key("sidekick") {
+        let cfg = config_json();
+        let key = effort_memory_key(pid, base, "gray-fusion");
+        if let Some(v) = cfg.get("parts_memory").and_then(|pm| pm.get(&key)) {
+            parts = serde_json::from_value(v.clone()).unwrap_or_default();
+        }
+    }
     let sidekick = parts.get("sidekick")?.clone();
     let qualified = if sidekick.contains(':') {
         sidekick
     } else {
-        let pid = m.get("provider_id").and_then(|v| v.as_str()).unwrap_or("");
-        let base = m.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
         let list_key = if !pid.is_empty() {
             plugin_models_key(pid)
         } else {
@@ -413,6 +426,154 @@ fn drop_session(home: &Path, lead: &str, qualified: &str) {
     let _ = std::fs::remove_file(session_file(home, lead, qualified));
 }
 
+fn sidekick_effort() -> Option<String> {
+    if let Ok(v) = std::env::var(ENV_SIDEKICK_EFFORT) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let cfg = config_json();
+    let v = cfg
+        .get("fusion")
+        .and_then(|f| f.get("sidekick_effort"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+fn session_idle_secs(home: &Path, lead: &str, qualified: &str) -> Option<u64> {
+    let meta = std::fs::metadata(session_file(home, lead, qualified)).ok()?;
+    let modified = meta.modified().ok()?;
+    let now = std::time::SystemTime::now();
+    now.duration_since(modified).ok().map(|d| d.as_secs())
+}
+
+struct Ledger<'a> {
+    lead: &'a str,
+    qualified: &'a str,
+    effort: Option<String>,
+    resumed: bool,
+    retried_fresh: bool,
+    idle_secs: Option<u64>,
+    outcome: &'a str,
+    wall_secs: f64,
+    brief_chars: usize,
+    report_chars: usize,
+    usage: Usage,
+    requests: u64,
+    tools: u64,
+}
+
+fn write_ledger(home: &Path, row: &Ledger) {
+    let dir = home.join("fusion");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stats.jsonl"))
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = json!({
+        "ts": ts,
+        "lead_sid": row.lead,
+        "sidekick": row.qualified,
+        "effort": row.effort,
+        "resumed": row.resumed,
+        "retried_fresh": row.retried_fresh,
+        "idle_secs": row.idle_secs,
+        "outcome": row.outcome,
+        "wall_secs": (row.wall_secs * 1000.0).round() / 1000.0,
+        "brief_chars": row.brief_chars,
+        "report_chars": row.report_chars,
+        "usage": row.usage.to_json(),
+        "requests": row.requests,
+        "tools": row.tools,
+    })
+    .to_string();
+    let _ = f.write_all(format!("{line}\n").as_bytes());
+}
+
+fn fusion_stats(argv: &[String], sid: &str) -> String {
+    let all = argv.iter().any(|a| a == "--all");
+    let path = gray_home().join("fusion/stats.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if !all && v.get("lead_sid").and_then(|s| s.as_str()) != Some(sid) {
+            continue;
+        }
+        rows.push(v);
+    }
+    let scope = if all {
+        "all sessions".to_string()
+    } else {
+        format!("session {}", if sid.is_empty() { "-" } else { sid })
+    };
+    if rows.is_empty() {
+        return format!("fusion stats: no handoffs recorded ({scope})");
+    }
+    let mut ok = 0;
+    let mut failed = 0;
+    let mut timeout = 0;
+    let mut cancelled = 0;
+    let mut cold = 0;
+    let mut wall = 0.0;
+    let mut tokens = [0u64; 5];
+    for row in &rows {
+        match row.get("outcome").and_then(|o| o.as_str()) {
+            Some("ok") => ok += 1,
+            Some("timeout") => timeout += 1,
+            Some("cancelled") => cancelled += 1,
+            _ => failed += 1,
+        }
+        if row
+            .get("idle_secs")
+            .and_then(|i| i.as_u64())
+            .is_some_and(|i| i > 300)
+        {
+            cold += 1;
+        }
+        wall += row.get("wall_secs").and_then(|w| w.as_f64()).unwrap_or(0.0);
+        if let Some(u) = row.get("usage") {
+            for (i, key) in [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_write_input_tokens",
+                "reasoning_tokens",
+            ]
+            .iter()
+            .enumerate()
+            {
+                tokens[i] += u.get(*key).and_then(|t| t.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    let n = rows.len();
+    format!(
+        "fusion stats: {scope}\n         handoffs: {n}\n         outcomes: ok={ok} failed={failed} timeout={timeout} cancelled={cancelled}\n         sidekick tokens: input={} output={} cache_read={} cache_write={} reasoning={}\n         cold resumes (idle > 300s): {cold}\n         mean wall: {:.1}s",
+        tokens[0],
+        tokens[1],
+        tokens[2],
+        tokens[3],
+        tokens[4],
+        wall / n as f64
+    )
+}
+
 fn handoff_timeout() -> Duration {
     std::env::var("GRAY_FUSION_HANDOFF_TIMEOUT")
         .ok()
@@ -476,6 +637,8 @@ struct Pump {
     error: Option<String>,
     killed: bool,
     usage: Usage,
+    requests: u64,
+    tools: u64,
     last_text: String,
     last_tools: Vec<String>,
 }
@@ -541,6 +704,9 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
             if let Some(u) = row.get("usage") {
                 pump.usage.set_json(u);
             }
+            if let Some(n) = row.pointer("/accounting/requests").and_then(|v| v.as_u64()) {
+                pump.requests += n;
+            }
         }
         Some("error") => {
             let msg = row
@@ -565,6 +731,9 @@ fn handle_row(line: &str, pump: &mut Pump, home: &Path, lead: &str, qualified: &
                     }
                 }
                 Some("tool_started" | "tool_ran" | "tool_finished") => {
+                    if row.get("phase").and_then(|p| p.as_str()) == Some("tool_started") {
+                        pump.tools += 1;
+                    }
                     let label = row
                         .get("label")
                         .or_else(|| row.get("tool"))
@@ -687,6 +856,7 @@ struct RunCtx<'a> {
     home: &'a Path,
     lead: &'a str,
     qualified: &'a str,
+    effort: Option<&'a str>,
 }
 
 fn run_child(
@@ -706,13 +876,15 @@ fn run_child(
         error: None,
         killed: false,
         usage: Usage::default(),
+        requests: 0,
+        tools: 0,
         last_text: String::new(),
         last_tools: Vec::new(),
     };
     let timeout = handoff_timeout();
     let task_owned;
     let task = if session.is_none() {
-        task_owned = format!("{SIDEKICK_CONTRACT}\n{task}");
+        task_owned = format!("{SIDEKICK_CONTRACT}\n{task}\n</lead_handoff>");
         task_owned.as_str()
     } else {
         task
@@ -752,6 +924,9 @@ fn run_child(
                 .max(timeout.as_secs() / 2)
                 .to_string(),
         );
+    if let Some(effort) = ctx.effort {
+        cmd.env("GRAY_THINKING_EFFORT", effort);
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -899,23 +1074,52 @@ fn partial_report(pump: &Pump) -> String {
 }
 
 fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified: &str) -> Value {
+    let started = Instant::now();
     let home = gray_home();
+    let effort = sidekick_effort();
     let Some(spec) = resolve_sidekick(qualified) else {
+        let content = format!("cannot resolve sidekick model '{qualified}'");
+        write_ledger(
+            &home,
+            &Ledger {
+                lead,
+                qualified,
+                effort,
+                resumed: false,
+                retried_fresh: false,
+                idle_secs: None,
+                outcome: "failed",
+                wall_secs: started.elapsed().as_secs_f64(),
+                brief_chars: task.chars().count(),
+                report_chars: content.chars().count(),
+                usage: Usage::default(),
+                requests: 0,
+                tools: 0,
+            },
+        );
         return json!({
-            "content": format!("cannot resolve sidekick model '{qualified}'"),
+            "content": content,
             "is_error": true,
         });
     };
     let session = read_session(&home, lead, qualified);
     let resumed = session.is_some();
+    let idle_secs = if resumed {
+        session_idle_secs(&home, lead, qualified)
+    } else {
+        None
+    };
     let ctx = RunCtx {
         cwd,
         home: &home,
         lead,
         qualified,
+        effort: effort.as_deref(),
     };
     let pump = run_child(slot, &spec, task, session.as_deref(), &ctx);
+    let mut retried_fresh = false;
     let pump = if pump.error.is_some() && !pump.killed && resumed {
+        retried_fresh = true;
         drop_session(&home, lead, qualified);
         let mut retry = run_child(slot, &spec, task, None, &ctx);
         retry.usage.input_tokens += pump.usage.input_tokens;
@@ -923,11 +1127,24 @@ fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified:
         retry.usage.cache_read_input_tokens += pump.usage.cache_read_input_tokens;
         retry.usage.cache_write_input_tokens += pump.usage.cache_write_input_tokens;
         retry.usage.reasoning_tokens += pump.usage.reasoning_tokens;
+        retry.requests += pump.requests;
+        retry.tools += pump.tools;
         retry
     } else {
         pump
     };
     let timeout_secs = handoff_timeout().as_secs();
+    let outcome = if pump.killed {
+        if pump.error.as_deref() == Some("handoff cancelled") {
+            "cancelled"
+        } else {
+            "timeout"
+        }
+    } else if pump.error.is_some() {
+        "failed"
+    } else {
+        "ok"
+    };
     let reply = if pump.killed {
         let sid = pump.session_id.clone().unwrap_or_else(|| "none".into());
         let cancelled = pump.error.as_deref() == Some("handoff cancelled");
@@ -961,6 +1178,28 @@ fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, qualified:
             "usage": pump.usage.to_json(),
         })
     };
+    write_ledger(
+        &home,
+        &Ledger {
+            lead,
+            qualified,
+            effort,
+            resumed,
+            retried_fresh,
+            idle_secs,
+            outcome,
+            wall_secs: started.elapsed().as_secs_f64(),
+            brief_chars: task.chars().count(),
+            report_chars: reply
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.chars().count())
+                .unwrap_or(0),
+            usage: pump.usage,
+            requests: pump.requests,
+            tools: pump.tools,
+        },
+    );
     let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
     st.finished = true;
     st.reply = Some(reply.clone());
@@ -1138,6 +1377,8 @@ fn manifest() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.3",
         "tools": [],
+        "commands": ["/fusion"],
+        "command_descriptions": {"/fusion": "sidekick handoff ledger: stats [--all]"},
         "composite_rows": [{
             "id": "gray-fusion",
             "name": "Fusion",
@@ -1218,7 +1459,10 @@ fn main() {
                     .and_then(|p| p.get("session"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                eprintln!("fusion probe: tools req session={}", &sess.to_string()[..sess.to_string().len().min(300)]);
+                eprintln!(
+                    "fusion probe: tools req session={}",
+                    &sess.to_string()[..sess.to_string().len().min(300)]
+                );
                 eprintln!("fusion probe: active={}", active(Some(&sess)).is_some());
                 let tools = if active(Some(&sess)).is_some() {
                     tool_defs()
@@ -1226,6 +1470,35 @@ fn main() {
                     Vec::new()
                 };
                 reply(id, json!({"tools": tools}));
+            }
+            Some("command/run") => {
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('/')
+                    .to_string();
+                let argv: Vec<String> = params
+                    .get("argv")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let sid = params
+                    .pointer("/session/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = if name == "fusion" {
+                    fusion_stats(&argv, &sid)
+                } else {
+                    format!("unknown command {name}")
+                };
+                reply(id, json!({"text": text}));
             }
             Some("tool/call") => {
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
