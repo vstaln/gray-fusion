@@ -90,6 +90,7 @@ EOF
     cat >"$HOME_DIR/auth.json" <<EOF
 {"custom:127.0.0.1:$port":"e2e-stub-key"}
 EOF
+    printf '[{"name":"E2E Stub","base_url":"%s","keyless":false}]\n' "$base" >"$HOME_DIR/custom_endpoints.json"
     printf '{"%s":{"fetched_at":%s,"rows":%s}}\n' "$base" "$(date +%s)" "$rows" >"$HOME_DIR/provider_models.json"
     if [ "$NEW_MODE" = 1 ]; then
         env -i PATH="$PATH" HOME="$HOME" \
