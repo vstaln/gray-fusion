@@ -12,7 +12,7 @@ const ENV_SIDEKICK: &str = "GRAY_FUSION_SIDEKICK";
 const ENV_HANDOFF_ID: &str = "GRAY_FUSION_HANDOFF_ID";
 const ENV_SIDEKICK_EFFORT: &str = "GRAY_FUSION_SIDEKICK_EFFORT";
 
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_TIMEOUT_SECS: u64 = 1200;
 const WAIT_DEFAULT_SECS: u64 = 300;
 const WAIT_MAX_SECS: u64 = 3600;
 const TERM_GRACE: Duration = Duration::from_secs(10);
@@ -20,32 +20,14 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 const LINE_CAP: usize = 1024 * 1024;
 const STDERR_TAIL: usize = 2048;
 
-const PROMPT_VARIANT: &str = "default-v3";
+const PROMPT_VARIANT: &str = "default-v4";
 
 const LEAD_PROMPT: &str = r#"\
-You have a `handoff` tool: a conversation-persistent sidekick subagent that works alongside you on the same worktree (shared files; each child has separate shell sessions). You are the lead: you own the outcome and the user-facing and authority actions — talking to the user, planning, and directing the sidekick. The user interacts with one agent: you. Unless they explicitly ask about the sidekick, do not mention it or distinguish its work from yours; own the combined result and present it in the first person.
-
-- **Plan first, then delegate one step at a time.** Do the exploration that shapes the plan yourself: read the code and run the quick probes the plan depends on. Then hand off one bounded step (setup, one implementation step, one verification run) with exact files, exact commands and a "done when" line, and review its result before sending the next step. Never hand off the whole task in one brief. Environment setup, installs, builds and long test runs go to the sidekick, dispatched with `"block": false` while you keep reading. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration), review, and everything user-facing or authority-bound (commits, pushes, PRs, CI administration, answering the user).
-- Each handoff is capped at a few minutes. A timed-out handoff returns the sidekick's partial work to you; take over or send a narrower step.
-- A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait`. Do not run the same work yourself in parallel. A second handoff while busy is rejected; it does not steer or create another worker. Collect a finished report before dispatching another task.
-- The plugin passes your brief, not the user's messages or your conversation; shared repository files remain accessible. Write each brief self-contained: the goal, file pointers, the decisions that matter (interfaces, data shapes, the cases that must pass), the constraints and edge cases you know, and the narrowest verification commands; tell it to run them and leave their output. Settle anything with more than one reasonable answer; leave the line-by-line implementation to the sidekick. Claims you have not checked go in as hypotheses for the sidekick to verify first, not as reasons to keep exploring yourself.
-- The saved conversation can resume across handoffs; runtime state does not persist. Each attempt starts a new child. Do not rely on dev servers, background jobs, or in-flight commands surviving: probe and restart them as needed. A failed resumed session may be retried fresh with failure evidence. A cold-resume notice means idle time exceeded 300 seconds.
-- Never make the sidekick redo work you already did: results you derived go into the brief as settled inputs. The same holds in reverse: do not redo the sidekick's work.
-- A sidekick report is a claim; the artifacts are the evidence. Review the diff and the verification output it left, and give a verdict before your next action. Rerun the deciding check yourself when it takes seconds, when the report and the artifacts disagree, or when no output was left; otherwise read its output. If it falls short, batch every defect, with the exact failing output, into one rework handoff instead of fixing it piecemeal yourself.
-
-On failure the plugin makes one evidence-bearing retry, then tries the next model in fusion_ladder when configured. Exhaustion returns "this needs your hands"; cancellation does not retry. You still decide whether to accept the artifacts."#;
+You have a `handoff` tool that delegates work to a sidekick agent working in the same files. The sidekick keeps its own conversation across handoffs but sees only your briefs, not the user or your conversation, so each brief must stand alone. A blocking handoff waits up to five minutes; if the sidekick is still working then, it continues in the background and `handoff_wait` collects the report. One handoff runs at a time. A report is a claim: check the artifacts before relying on it. A failed handoff is retried once with the failure evidence. The user talks only to you, so present the combined work as your own."#;
 
 const SIDEKICK_CONTRACT: &str = "<sidekick_contract>
-You are the sidekick: a conversation-persistent collaborator agent executing task briefs handed off by the lead agent. The plugin supplies the brief and your own saved conversation, not the user's messages or the lead's conversation. Shared files are accessible. Your process and shell state are not persistent across handoffs; verify reachability and restart needed processes. Work autonomously with your own tools and verify your work before reporting.
-
-- The lead owns user-facing and authority actions. Do not contact the user, create or update pull requests, commit, push, or administer CI — for ordinary implementation tasks leave the work tree ready for the lead to review. If the task needs something only the lead or user can do (a secret, information only the user has, a PR action), stop and report what you need instead of working around it.
-- Git safety: never run destructive or irreversible git commands unless the brief directs it; stage files explicitly (never `git add .`) and never stage files likely to contain secrets.
-- Keep diffs minimal and match the repo's existing conventions; touch only what the task asks for.
-- Report back so it stands alone — the lead receives your report and owns the user-facing answer: what you did or found, how you verified it (commands run, results, evidence paths — leave the artifacts in place for the lead to read), any deviations, and anything left for the lead.
-If the brief conflicts with the lead-owned authority boundary, report the conflict rather than acting.
+You are a sidekick working on briefs from a lead agent, in the same files. You see only the lead's briefs. The lead owns the user and authority actions: do not contact the user, commit, push, or touch pull requests or CI. Finish with a report that stands alone: what you did, how you verified it, and anything you need from the lead.
 </sidekick_contract>
-
-This is your first handoff from the lead. Work it to completion, then end your final message with a concise report of what you did, the evidence (diffs, test output), and anything you need from the lead.
 
 <lead_handoff>";
 
@@ -1257,9 +1239,21 @@ fn tool_call(params: &Value) -> Value {
                     "is_error": false,
                 });
             }
+            let deadline = Instant::now() + Duration::from_secs(WAIT_DEFAULT_SECS);
             let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
             while !st.finished {
-                st = slot.done.wait(st).unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                if now >= deadline {
+                    return json!({
+                        "content": format!("{notice}handoff {} still running after {WAIT_DEFAULT_SECS}s; it continues in the background. Do independent work or call handoff_wait; do not redo its work.", slot.handoff_id),
+                        "is_error": false,
+                    });
+                }
+                let (guard, _t) = slot
+                    .done
+                    .wait_timeout(st, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                st = guard;
             }
             take_reply(&lead, &slot, st)
         }
