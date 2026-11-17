@@ -917,3 +917,7 @@ echo
 echo "== results ($ROOT/results.txt) =="
 cat "$RESULTS"
 echo "wall: $(( $(date +%s) - T0 ))s"
+
+if grep -q "^FAIL" "$RESULTS" || [ ! -s "$RESULTS" ]; then
+    exit 1
+fi
