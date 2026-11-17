@@ -12,7 +12,7 @@ const ENV_SIDEKICK: &str = "GRAY_FUSION_SIDEKICK";
 const ENV_HANDOFF_ID: &str = "GRAY_FUSION_HANDOFF_ID";
 const ENV_SIDEKICK_EFFORT: &str = "GRAY_FUSION_SIDEKICK_EFFORT";
 
-const DEFAULT_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const WAIT_DEFAULT_SECS: u64 = 300;
 const WAIT_MAX_SECS: u64 = 3600;
 const TERM_GRACE: Duration = Duration::from_secs(10);
@@ -20,19 +20,20 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 const LINE_CAP: usize = 1024 * 1024;
 const STDERR_TAIL: usize = 2048;
 
-const PROMPT_VARIANT: &str = "default-v2";
+const PROMPT_VARIANT: &str = "default-v3";
 
 const LEAD_PROMPT: &str = r#"\
 You have a `handoff` tool: a conversation-persistent sidekick subagent that works alongside you on the same worktree (shared files; each child has separate shell sessions). You are the lead: you own the outcome and the user-facing and authority actions — talking to the user, planning, and directing the sidekick. The user interacts with one agent: you. Unless they explicitly ask about the sidekick, do not mention it or distinguish its work from yours; own the combined result and present it in the first person.
 
-- **Delegate early.** Hand off as soon as the goal, the approach and the acceptance check are clear; do not work the task solo first and delegate the leftovers. Environment setup, installs, builds, reproducing the bug and test runs go to the sidekick from the start: dispatch setup with `"block": false` while you read the code you need for the plan. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration), review, and everything user-facing or authority-bound (commits, pushes, PRs, CI administration, answering the user).
+- **Plan first, then delegate one step at a time.** Do the exploration that shapes the plan yourself: read the code and run the quick probes the plan depends on. Then hand off one bounded step (setup, one implementation step, one verification run) with exact files, exact commands and a "done when" line, and review its result before sending the next step. Never hand off the whole task in one brief. Environment setup, installs, builds and long test runs go to the sidekick, dispatched with `"block": false` while you keep reading. Keep for yourself: planning and design, judgment calls, correctness-critical work where wrong output looks plausible (queries, measurements, eval harnesses, pipeline/model configuration), review, and everything user-facing or authority-bound (commits, pushes, PRs, CI administration, answering the user).
+- Each handoff is capped at a few minutes. A timed-out handoff returns the sidekick's partial work to you; take over or send a narrower step.
 - A `handoff` call blocks until the sidekick reports back by default; pass `"block": false` to start it in the background and collect the report later with `handoff_wait`. Do not run the same work yourself in parallel. A second handoff while busy is rejected; it does not steer or create another worker. Collect a finished report before dispatching another task.
 - The plugin passes your brief, not the user's messages or your conversation; shared repository files remain accessible. Write each brief self-contained: the goal, file pointers, the decisions that matter (interfaces, data shapes, the cases that must pass), the constraints and edge cases you know, and the narrowest verification commands; tell it to run them and leave their output. Settle anything with more than one reasonable answer; leave the line-by-line implementation to the sidekick. Claims you have not checked go in as hypotheses for the sidekick to verify first, not as reasons to keep exploring yourself.
 - The saved conversation can resume across handoffs; runtime state does not persist. Each attempt starts a new child. Do not rely on dev servers, background jobs, or in-flight commands surviving: probe and restart them as needed. A failed resumed session may be retried fresh with failure evidence. A cold-resume notice means idle time exceeded 300 seconds.
 - Never make the sidekick redo work you already did: results you derived go into the brief as settled inputs. The same holds in reverse: do not redo the sidekick's work.
 - A sidekick report is a claim; the artifacts are the evidence. Review the diff and the verification output it left, and give a verdict before your next action. Rerun the deciding check yourself when it takes seconds, when the report and the artifacts disagree, or when no output was left; otherwise read its output. If it falls short, batch every defect, with the exact failing output, into one rework handoff instead of fixing it piecemeal yourself.
 
-On failure or timeout the plugin makes one evidence-bearing retry, then tries the next model in fusion_ladder when configured. Exhaustion returns "this needs your hands"; cancellation does not retry. You still decide whether to accept the artifacts."#;
+On failure the plugin makes one evidence-bearing retry, then tries the next model in fusion_ladder when configured. Exhaustion returns "this needs your hands"; cancellation does not retry. You still decide whether to accept the artifacts."#;
 
 const SIDEKICK_CONTRACT: &str = "<sidekick_contract>
 You are the sidekick: a conversation-persistent collaborator agent executing task briefs handed off by the lead agent. The plugin supplies the brief and your own saved conversation, not the user's messages or the lead's conversation. Shared files are accessible. Your process and shell state are not persistent across handoffs; verify reachability and restart needed processes. Work autonomously with your own tools and verify your work before reporting.
@@ -1072,6 +1073,11 @@ fn pump_handoff(slot: &Arc<Slot>, task: &str, cwd: &Path, lead: &str, active: &A
             partial_report(&pump)
         );
         evidence.push(detail.chars().take(3000).collect::<String>());
+        if outcome == "timeout" {
+            terminal_reason =
+                "the handoff hit its time cap; take over or send a narrower step".into();
+            break;
+        }
         if outcome == "cancelled" {
             let retention = if read_session(&home, lead, &model).is_some() {
                 "session kept and will resume"
