@@ -1369,10 +1369,14 @@ fn shutdown_drain() {
 }
 
 fn reply(id: u64, result: Value) {
+    write_frame(&json!({"id": id, "result": result}));
+}
+
+fn write_frame(frame: &Value) {
     static STDOUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "{}", json!({"id": id, "result": result}));
+    let _ = writeln!(out, "{frame}");
     let _ = out.flush();
 }
 
@@ -1464,7 +1468,9 @@ fn main() {
                     reply(id, result);
                 });
             }
-            Some(method) => reply(id, json!({"error": format!("no handler for {method}")})),
+            Some(method) => write_frame(
+                &json!({"id": id, "error": {"code": -32601, "message": format!("method not found: {method}")}}),
+            ),
             None => {}
         }
     }
