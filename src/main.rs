@@ -1380,6 +1380,18 @@ fn reply(id: u64, result: Value) {
     let _ = out.flush();
 }
 
+fn reply_err(id: u64, code: i64, message: &str) {
+    static STDOUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "{}",
+        json!({"id": id, "error": {"code": code, "message": message}})
+    );
+    let _ = out.flush();
+}
+
 fn main() {
     let arg = std::env::args().nth(1);
     if arg.as_deref() == Some("manifest") {
@@ -1468,7 +1480,7 @@ fn main() {
                     reply(id, result);
                 });
             }
-            Some(method) => reply(id, json!({"error": format!("no handler for {method}")})),
+            Some(method) => reply_err(id, -32601, &format!("method not found: {method}")),
             None => {}
         }
     }
